@@ -1,0 +1,13 @@
+
+services:
+  web:
+    build: .
+    container_name: bentopdf_app
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    volumes:
+      # Пробрасываем папки наружу на хост, чтобы видеть загруженные файлы и debug-растры
+      - ./debug:/app/debug
+    restart: unless-stopped

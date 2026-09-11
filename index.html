@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="ru" spellcheck="false">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BentoPDF</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf_viewer.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+</head>
+<body spellcheck="false" autocorrect="off" autocapitalize="off" autocomplete="off" data-gramm="false">
+<div class="page" id="main-container" spellcheck="false">
+
+  <!-- ЕДИНЫЙ ТУМБЛЕР РЕЖИМА ОБРАБОТКИ -->
+  <div class="mode-selector" style="max-width: 480px; margin: 0 auto 24px auto;">
+    <button class="mode-btn active" id="pipeline-mode-native">
+      Обычный режим (PDF)
+    </button>
+    <button class="mode-btn" id="pipeline-mode-ocr">
+      OCR режим (для сканов)
+    </button>
+  </div>
+
+  <!-- ЭКРАН 1: ЗАГРУЗКА ФАЙЛА -->
+  <div id="viewer-upload-screen">
+    <div class="dropzone" id="viewer-dropzone">
+      <input type="file" id="viewer-file-input" accept="application/pdf" hidden>
+      <svg class="upload-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+        <path d="M12 16V4M12 4l-4 4M12 4l4 4"/>
+        <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+      </svg>
+      <div class="dropzone-text"><b>Выберите или перетащите PDF-файл</b></div>
+      <div class="dropzone-sub" id="pipeline-hint-text">Быстрое открытие с выделением и копированием текста.</div>
+    </div>
+  </div>
+
+  <!-- ЭКРАН 2: ПРОГРЕСС -->
+  <div id="viewer-progress-screen" class="hidden">
+    <div class="status-box">
+      <div class="spinner"></div>
+      <div class="status-text" id="viewer-status-text">Загрузка документа…</div>
+      <div class="status-sub" id="viewer-status-sub"></div>
+    </div>
+  </div>
+
+  <!-- ЭКРАН 3: ОШИБКА -->
+  <div id="viewer-error-screen" class="hidden">
+    <div class="error-box">
+      <div class="error-title" id="viewer-error-title">Не удалось открыть документ</div>
+      <div class="error-text" id="viewer-error-text"></div>
+      <button class="btn btn-secondary" id="viewer-retry-btn">Попробовать снова</button>
+    </div>
+  </div>
+
+  <!-- ЭКРАН 4: РАБОЧАЯ ОБЛАСТЬ С ЛИСТОМ -->
+  <div id="viewer-workspace" class="hidden">
+    <div class="editor-toolbar">
+      <div class="toolbar-group">
+        <button class="btn btn-ghost btn-sm" id="viewer-prev-page" title="Предыдущая страница">◀</button>
+        <div class="editor-page-indicator" id="viewer-page-indicator">
+          <span>Стр.</span>
+          <input type="number" id="viewer-page-input" min="1" max="1" value="1" title="Введите номер страницы">
+          <span id="viewer-page-total">/ 1</span>
+        </div>
+        <button class="btn btn-ghost btn-sm" id="viewer-next-page" title="Следующая страница">▶</button>
+        <span class="source-badge" id="viewer-source-badge">NATIVE</span>
+      </div>
+
+      <!-- Контролы зума -->
+      <div class="toolbar-group">
+        <div class="zoom-controls">
+          <button class="btn btn-ghost btn-sm" id="viewer-zoom-out" title="Уменьшить" style="padding: 2px 8px;">−</button>
+          <span id="viewer-zoom-value" style="font-size: 13px; font-weight: 600; min-width: 44px; text-align: center;">100%</span>
+          <button class="btn btn-ghost btn-sm" id="viewer-zoom-in" title="Увеличить" style="padding: 2px 8px;">+</button>
+        </div>
+      </div>
+
+      <div class="toolbar-group">
+        <button class="btn btn-ghost btn-sm active-tool" id="viewer-tool-select" title="Выделение и копирование">Выделение</button>
+        <button class="btn btn-ghost btn-sm" id="viewer-tool-edit" title="Редактирование блоков">Редактирование</button>
+        <button class="btn btn-ghost btn-sm" id="viewer-tool-add-text" title="Добавить текстовый блок">➕ Текст</button>
+        <button class="btn btn-ghost btn-sm" id="viewer-tool-line" title="Чертить прямые линии (Зажмите Shift для горизонтали/вертикали)">📏 Линия</button>
+      </div>
+
+      <!-- Панель рисования линий -->
+      <div class="toolbar-group hidden" id="viewer-line-panel">
+        <span class="toolbar-divider"></span>
+        <label class="color-picker-wrapper" title="Выбрать цвет линии">
+          <input type="color" id="viewer-line-color" value="#000000">
+        </label>
+        <button class="btn btn-ghost btn-sm" id="viewer-eyedropper-btn" title="Пипетка: взять цвет со скана">💧</button>
+        <select id="viewer-line-width" class="font-select" title="Толщина линии" style="padding: 4px 6px; font-size: 12.5px; width: 70px;">
+          <option value="1">1 pt</option>
+          <option value="1.5">1.5 pt</option>
+          <option value="2">2 pt</option>
+          <option value="3">3 pt</option>
+          <option value="4">4 pt</option>
+        </select>
+      </div>
+
+      <!-- Панель форматирования текста -->
+      <div class="toolbar-group" id="viewer-text-format-panel" style="gap: 4px;">
+        <span class="toolbar-divider"></span>
+        <select id="viewer-font-family" class="font-select" style="padding: 4px 8px; font-size: 12.5px; max-width: 140px;">
+          <option value="Arial">Arial</option>
+          <option value="Times New Roman">Times New Roman</option>
+          <option value="Calibri">Calibri</option>
+          <option value="Courier New">Courier New</option>
+          <option value="Georgia">Georgia</option>
+          <option value="Verdana">Verdana</option>
+          <option value="Tahoma">Tahoma</option>
+          <option value="Trebuchet MS">Trebuchet MS</option>
+        </select>
+        <select id="viewer-font-size" class="font-select" style="padding: 4px 6px; font-size: 12.5px; width: 66px;">
+          <option value="6">6 pt</option>
+          <option value="7">7 pt</option>
+          <option value="8">8 pt</option>
+          <option value="9">9 pt</option>
+          <option value="10">10 pt</option>
+          <option value="11" selected>11 pt</option>
+          <option value="12">12 pt</option>
+          <option value="13">13 pt</option>
+          <option value="14">14 pt</option>
+          <option value="16">16 pt</option>
+          <option value="18">18 pt</option>
+          <option value="20">20 pt</option>
+          <option value="24">24 pt</option>
+          <option value="28">28 pt</option>
+          <option value="32">32 pt</option>
+          <option value="36">36 pt</option>
+          <option value="48">48 pt</option>
+          <option value="72">72 pt</option>
+        </select>
+        <button class="btn btn-ghost btn-sm" id="viewer-fmt-bold" title="Жирный" style="padding: 4px 9px; font-weight: 800;">B</button>
+        <button class="btn btn-ghost btn-sm" id="viewer-fmt-italic" title="Курсив" style="padding: 4px 9px; font-style: italic; font-family: serif;">I</button>
+        <button class="btn btn-ghost btn-sm" id="viewer-fmt-underline" title="Подчёркивание" style="padding: 4px 9px; text-decoration: underline;">U</button>
+      </div>
+
+      <div class="toolbar-group">
+        <div class="undo-redo-controls">
+          <button class="btn btn-ghost btn-sm" id="viewer-undo-btn" title="Отменить (Ctrl+Z)" disabled>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 7v6h6"></path>
+              <path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"></path>
+            </svg>
+          </button>
+          <button class="btn btn-ghost btn-sm" id="viewer-redo-btn" title="Вернуть (Ctrl+Y)" disabled>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 7v6h-6"></path>
+              <path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3l3 2.7"></path>
+            </svg>
+          </button>
+        </div>
+        <span class="toolbar-divider"></span>
+        <button class="btn btn-primary btn-sm" id="viewer-save-pdf-btn">💾 Скачать PDF</button>
+        <button class="btn btn-secondary btn-sm" id="viewer-export-docx-btn">📄 Экспорт в Word</button>
+        <button class="btn btn-secondary btn-sm" id="viewer-new-file-btn">Новый файл</button>
+      </div>
+    </div>
+
+    <!-- Область просмотра и холст документа -->
+    <div class="editor-viewport" id="viewer-viewport">
+      <div class="editor-canvas-stage" id="viewer-canvas-stage">
+        <canvas id="viewer-page-canvas" class="editor-bg-image hidden"></canvas>
+        <img id="viewer-page-img" class="editor-bg-image hidden" alt="Страница PDF">
+
+        <div id="viewer-text-layer" class="editor-overlay-layer textLayer" spellcheck="false"></div>
+        <div id="viewer-overlay-layer" class="editor-overlay-layer" spellcheck="false"></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Модальное окно выбора режима сохранения PDF -->
+<div id="save-modal-overlay" class="modal-overlay hidden">
+  <div class="modal-dialog" id="save-modal-dialog">
+    <div class="modal-header">
+      <h3 class="modal-title">Выберите режим сохранения PDF</h3>
+      <p class="modal-subtitle">Как вы хотите сохранить итоговый документ?</p>
+    </div>
+    <div class="modal-buttons-grid">
+      <button class="save-option-card" id="btn-save-raster">
+        <div class="option-icon">📷</div>
+        <div class="option-title">Сохранить как скан</div>
+        <div class="option-desc">Документ запекается в картинку. Нет текстовых слоёв, нельзя выделить или найти текст. Выглядит как настоящий скан.</div>
+      </button>
+      <button class="save-option-card" id="btn-save-searchable">
+        <div class="option-icon">📄</div>
+        <div class="option-title">Сохранить с текстом</div>
+        <div class="option-desc">Обычный PDF. Текст можно выделять курсором, копировать в буфер и искать по документу.</div>
+      </button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="{{ url_for('static', filename='pdf_viewer.js') }}"></script>
+</body>
+</html>

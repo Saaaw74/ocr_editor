@@ -1,0 +1,12 @@
+flask
+pymupdf
+paddleocr
+paddlepaddle
+scipy
+numpy
+pillow
+python-docx
+pydantic
+requests
+opencv-python-headless
+gunicorn

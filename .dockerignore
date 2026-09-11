@@ -1,0 +1,11 @@
+.env
+.git
+.vscode
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+debug/
+document_uploads/
+ocr_uploads/
