@@ -7,7 +7,8 @@ import io
 import logging
 import math
 import os
-from typing import Any, Tuple, Optional
+import threading
+from typing import Any, Dict, Tuple, Optional
 try:
     from PIL import Image, ImageDraw, ImageFilter, ImageFont
 except ImportError:  # pragma: no cover
@@ -19,6 +20,26 @@ except ImportError:  # pragma: no cover
     np = None
 
 logger = logging.getLogger("ocr_degradation")
+
+# ============================ Потокобезопасный кэш FreeType-шрифтов ============================
+# Аналогично ocr_typography.py: render_text_patch тоже дергает ImageFont.truetype
+# на каждую строку. При параллельной обработке нескольких страниц (несколько
+# потоков) конкурентное открытие/использование FreeType-шрифта может уронить
+# процесс на Linux - поэтому открытие и использование FT_Face идут под общим
+# локом, а уже открытые шрифты кэшируются по (путь, размер_px).
+_FONT_CACHE_LOCK = threading.RLock()
+_FONT_OBJ_CACHE: Dict[Tuple[str, int], Any] = {}
+
+
+def _get_cached_font(font_path: str, size_px: int) -> Any:
+    """Возвращает уже открытый шрифт из кэша либо открывает и кэширует новый.
+    Вызывать ТОЛЬКО под _FONT_CACHE_LOCK."""
+    key = (font_path, int(size_px))
+    font = _FONT_OBJ_CACHE.get(key)
+    if font is None:
+        font = ImageFont.truetype(font_path, size=int(size_px))
+        _FONT_OBJ_CACHE[key] = font
+    return font
 
 # ============================ Параметры деградации текста ============================
 
@@ -285,28 +306,32 @@ def render_text_patch(text: str, font_path: str, font_size_pt: float,
     sup = max(1, p.sup)
     size_px = max(4, int(round(font_size_pt * sup)))
 
-    try:
-        font = ImageFont.truetype(font_path, size=size_px)
-        ascent, descent = font.getmetrics()
-    except Exception:  # noqa: BLE001
-        return None, None
+    # Вся работа с FT_Face (получение из кэша/открытие + метрики + рисование)
+    # выполняется под одним локом - защищает FreeType от параллельного доступа
+    # из нескольких потоков, обрабатывающих разные страницы одновременно.
+    with _FONT_CACHE_LOCK:
+        try:
+            font = _get_cached_font(font_path, size_px)
+            ascent, descent = font.getmetrics()
+        except Exception:  # noqa: BLE001
+            return None, None
 
-    try:
-        text_w_px = int(math.ceil(font.getlength(text)))
-    except Exception:  # noqa: BLE001
-        text_w_px = int(size_px * len(text) * 0.6)
+        try:
+            text_w_px = int(math.ceil(font.getlength(text)))
+        except Exception:  # noqa: BLE001
+            text_w_px = int(size_px * len(text) * 0.6)
 
-    margin = max(2, int(round(sup)))
-    canvas_w = text_w_px + 2 * margin
-    canvas_h = int(ascent + descent) + 2 * margin
-    baseline_y = margin + ascent
+        margin = max(2, int(round(sup)))
+        canvas_w = text_w_px + 2 * margin
+        canvas_h = int(ascent + descent) + 2 * margin
+        baseline_y = margin + ascent
 
-    img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
-    try:
-        draw = ImageDraw.Draw(img)
-        draw.text((margin, baseline_y), text, font=font, fill=(0, 0, 0, 255), anchor="ls")
-    except Exception:  # noqa: BLE001
-        return None, None
+        img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+        try:
+            draw = ImageDraw.Draw(img)
+            draw.text((margin, baseline_y), text, font=font, fill=(0, 0, 0, 255), anchor="ls")
+        except Exception:  # noqa: BLE001
+            return None, None
 
     alpha_arr = np.asarray(img.split()[3], dtype=np.float32)
 

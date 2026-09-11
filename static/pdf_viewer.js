@@ -1301,6 +1301,16 @@
 
   function requestNewFile() {
     if (!confirm('Закрыть текущий файл и открыть новый?')) return;
+
+    // Немедленно освобождаем память и удаляем временный PDF на сервере
+    if (viewerJobId) {
+      try {
+        fetch(`/api/document/${viewerJobId}`, { method: 'DELETE' });
+      } catch (e) {
+        console.warn('Не удалось уведомить сервер об удалении задачи:', e);
+      }
+    }
+
     fileInput.value = '';
     viewerJobId = null;
     pdfjsDoc = null;
@@ -1309,6 +1319,14 @@
   }
 
   retryBtn.addEventListener('click', () => {
+    if (viewerJobId) {
+      try {
+        fetch(`/api/document/${viewerJobId}`, { method: 'DELETE' });
+      } catch (e) {
+        console.warn('Не удалось уведомить сервер об удалении задачи:', e);
+      }
+    }
+
     fileInput.value = '';
     viewerJobId = null;
     pdfjsDoc = null;

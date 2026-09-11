@@ -5,13 +5,20 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
 import re
+import threading
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageFilter, ImageFont, ImageOps
 
 logger = logging.getLogger("ocr_typography")
+
+# ============================ ОС определяется один раз при старте ============================
+# Линукс/Docker никогда не должен трогать C:/Windows/... - лишние os.path.exists()
+# на несуществующий диск на каждую строку скана заметно тормозят подбор шрифта.
+_IS_WINDOWS = platform.system() == "Windows"
 
 # ============================ Константы ============================
 
@@ -62,6 +69,27 @@ WEIGHT_BOLD_MARGIN = 0.03
 _MASK_CACHE: Dict[tuple, "object"] = {}
 # Кэш найденного стиля страницы: key = hash пути к изображению страницы.
 _PAGE_STYLE_CACHE: Dict[tuple, "TypographyStyle"] = {}
+
+# ============================ Потокобезопасный кэш FreeType-шрифтов ============================
+# ImageFont.truetype() дергает libfreetype напрямую; параллельная загрузка/использование
+# одного и того же файла шрифта из нескольких потоков (несколько страниц обрабатываются
+# одновременно) может уронить процесс или потечь по памяти на Linux. Поэтому: (1) любое
+# открытие и любое использование FT_Face идёт под одним локом, (2) уже открытые шрифты
+# кэшируются по (путь, размер_px), чтобы не открывать файл повторно на каждый вызов.
+_FONT_CACHE_LOCK = threading.RLock()
+_FONT_OBJ_CACHE: Dict[Tuple[str, int], "ImageFont.FreeTypeFont"] = {}
+
+
+def _get_cached_font(font_path: str, size_px: int) -> "ImageFont.FreeTypeFont":
+    """Возвращает уже открытый объект шрифта из кэша либо открывает и кэширует новый.
+    Вызывать ТОЛЬКО под _FONT_CACHE_LOCK (см. использование ниже) - сам открытый
+    объект FT_Face не потокобезопасен при параллельном рендере глифов."""
+    key = (font_path, int(size_px))
+    font = _FONT_OBJ_CACHE.get(key)
+    if font is None:
+        font = ImageFont.truetype(font_path, size=int(size_px))
+        _FONT_OBJ_CACHE[key] = font
+    return font
 
 
 # ============================ Данные ============================
@@ -206,6 +234,12 @@ def resolve_system_font(family_name: str, is_bold: bool = False, is_italic: bool
             cands = ["C:/Windows/Fonts/arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
                      "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"]
 
+    if not _IS_WINDOWS:
+        # Linux/Docker: путь "C:/Windows/..." никогда не существует - не тратим
+        # на него os.path.exists() (это то самое обращение к несуществующему
+        # диску C:, которое тормозило подбор шрифта на каждой строке скана).
+        cands = [p for p in cands if not p.startswith("C:")]
+
     for p in cands:
         if os.path.exists(p):
             return p
@@ -313,17 +347,23 @@ def render_text_mask(font_path: str, text: str, size_px: float,
     if cached is not None:
         return cached
 
-    from PIL import ImageDraw, ImageFont
-    font = ImageFont.truetype(font_path, size=int(round(size_px)))
-    # Оценка размера холста через textlength/getbbox.
-    try:
-        w = int(font.getlength(text)) + 4
-    except Exception:  # noqa: BLE001
-        w = int(size_px * len(text) * 0.6) + 4
-    h = int(size_px * 1.6) + 4
-    img = Image.new("L", (max(2, w), max(2, h)), 255)
-    draw = ImageDraw.Draw(img)
-    draw.text((2, 2), text, font=font, fill=0)
+    from PIL import ImageDraw
+    size_px_int = int(round(size_px))
+
+    # Вся работа с FT_Face (получение из кэша/открытие + измерение + рисование)
+    # выполняется под одним локом - это защищает FreeType от параллельного
+    # доступа из нескольких потоков-обработчиков страниц.
+    with _FONT_CACHE_LOCK:
+        font = _get_cached_font(font_path, size_px_int)
+        # Оценка размера холста через textlength/getbbox.
+        try:
+            w = int(font.getlength(text)) + 4
+        except Exception:  # noqa: BLE001
+            w = int(size_px * len(text) * 0.6) + 4
+        h = int(size_px * 1.6) + 4
+        img = Image.new("L", (max(2, w), max(2, h)), 255)
+        draw = ImageDraw.Draw(img)
+        draw.text((2, 2), text, font=font, fill=0)
     mask = _binarize(np_float(img))
     stats = _ink_mask_stats(mask)
     _MASK_CACHE[key] = (mask, stats, w)
@@ -957,3 +997,5 @@ def _final_family(family: str) -> str:
 def clear_caches() -> None:
     _MASK_CACHE.clear()
     _PAGE_STYLE_CACHE.clear()
+    with _FONT_CACHE_LOCK:
+        _FONT_OBJ_CACHE.clear()

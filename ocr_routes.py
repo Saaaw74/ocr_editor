@@ -13,12 +13,11 @@ from ocr_pipeline import (
     OcrPipelineError,
 )
 
+from job_manager import job_manager
+
 logger = logging.getLogger("ocr_routes")
 
 ocr_bp = Blueprint("ocr_bp", __name__, url_prefix="/api/ocr")
-
-# Папка ocr_uploads удалена, данные хранятся в памяти (pdf_bytes)
-JOBS = {}
 
 
 @ocr_bp.route("/upload", methods=["POST"])
@@ -28,7 +27,6 @@ def upload_pdf():
     if not file or not file.filename.lower().endswith(".pdf"):
         return jsonify({"error": "Пожалуйста, загрузите файл в формате PDF."}), 400
 
-    job_id = uuid.uuid4().hex[:12]
     pdf_bytes = file.read()
 
     import fitz
@@ -39,82 +37,76 @@ def upload_pdf():
     except Exception as exc:
         return jsonify({"error": f"Не удалось открыть PDF: {exc}"}), 400
 
-    JOBS[job_id] = {
-        "filename": file.filename,
-        "pdf_bytes": pdf_bytes,
-        "page_count": page_count,
-        "progress": {"percent": 0, "step": "uploaded"},
-        "pages": {},
-    }
+    job = job_manager.create_job(
+        filename=file.filename,
+        pdf_bytes=pdf_bytes,
+        page_count=page_count,
+        mode="ocr",
+    )
     logger.info(f"[OCR] file={file.filename}")
-    return jsonify({"job_id": job_id, "page_count": page_count})
-
+    return jsonify({"job_id": job.job_id, "page_count": page_count})
 
 @ocr_bp.route("/<job_id>/progress", methods=["GET"])
 def get_progress(job_id):
-    """Опрашивается фронтендом во время обработки страницы (тот же поллинг-паттерн,
-    что уже используется в режиме PDF->DOCX)."""
-    job = JOBS.get(job_id)
+    job = job_manager.get_job(job_id)
     if not job:
         return jsonify({"error": "Задача не найдена"}), 404
-    return jsonify(job["progress"])
+    return jsonify(job.progress)
 
 
 @ocr_bp.route("/<job_id>/page/<int:page_num>", methods=["GET"])
 def get_page_ocr(job_id, page_num):
-    """
-    Основной эндпоинт этапа:
-    рендерит страницу, прогоняет через PaddleOCR, приводит к UDM через
-    adapters.parse_paddle_to_udm и отдаёт фронтенду.
-
-    Результат кэшируется в памяти на время жизни job'а (повторный запрос
-    той же страницы не гоняет OCR заново).
-    """
-    job = JOBS.get(job_id)
+    job = job_manager.get_job(job_id)
     if not job:
         return jsonify({"error": "Задача не найдена"}), 404
 
-    if page_num < 1 or page_num > job["page_count"]:
-        return jsonify({"error": f"Страница {page_num} вне диапазона (1..{job['page_count']})"}), 400
+    if page_num < 1 or page_num > job.page_count:
+        return jsonify({"error": f"Страница {page_num} вне диапазона (1..{job.page_count})"}), 400
 
-    if page_num in job["pages"]:
-        return jsonify(job["pages"][page_num])
+    if page_num in job.pages:
+        return jsonify(job.pages[page_num])
 
     def on_progress(percent, step):
-        job["progress"] = {"percent": percent, "step": step}
+        job.set_progress(percent, step)
 
     try:
+        # Передаем путь к временному файлу на диске вместо байтов в RAM
+        pdf_source = job.temp_pdf_path if os.path.exists(job.temp_pdf_path) else job.pdf_bytes
         result = process_single_page(
-            pdf_source=job["pdf_bytes"],
+            pdf_source=pdf_source,
             page_number=page_num,
             job_id=job_id,
             on_progress=on_progress,
         )
     except OcrPipelineError as exc:
-        job["progress"] = {"percent": 0, "step": "error"}
+        job.set_progress(0, "error")
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:  # noqa: BLE001
         logger.exception("[OCR] unexpected error")
-        job["progress"] = {"percent": 0, "step": "error"}
+        job.set_progress(0, "error")
         return jsonify({"error": f"Внутренняя ошибка OCR: {exc}"}), 500
 
     result["image_url"] = f"/api/ocr/{job_id}/render/{page_num}"
-    job["pages"][page_num] = result
+    job.pages[page_num] = result
     return jsonify(result)
 
 
 @ocr_bp.route("/<job_id>/render/<int:page_num>", methods=["GET"])
 def get_rendered_image(job_id, page_num):
-    """Отдаёт PNG отрендеренной страницы (фон для overlay)."""
-    job = JOBS.get(job_id)
-    if not job or not job.get("pdf_bytes"):
+    job = job_manager.get_job(job_id)
+    if not job:
         return jsonify({"error": "Задача не найдена"}), 404
 
     import io
     import fitz
     from flask import send_file
     try:
-        doc = fitz.open(stream=job["pdf_bytes"], filetype="pdf")
+        # Читаем сразу с диска
+        if os.path.exists(job.temp_pdf_path):
+            doc = fitz.open(job.temp_pdf_path)
+        else:
+            doc = fitz.open(stream=job.pdf_bytes, filetype="pdf")
+
         page = doc[page_num - 1]
         pix = page.get_pixmap(dpi=150, alpha=False)
         img_bytes = pix.tobytes("png")
@@ -135,8 +127,7 @@ def get_raw_debug(job_id, page_num):
 
 @ocr_bp.route("/<job_id>/normalized/<int:page_num>", methods=["GET"])
 def get_normalized_debug(job_id, page_num):
-    """Отдаёт normalized UDM JSON для диагностики."""
-    job = JOBS.get(job_id)
-    if not job or page_num not in job.get("pages", {}):
+    job = job_manager.get_job(job_id)
+    if not job or page_num not in job.pages:
         return jsonify({"error": "Normalized-результат не найден"}), 404
-    return jsonify(job["pages"][page_num])
+    return jsonify(job.pages[page_num])

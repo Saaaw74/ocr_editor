@@ -10,3 +10,4 @@ pydantic
 requests
 opencv-python-headless
 gunicorn
+cachetools>=5.3.0

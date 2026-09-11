@@ -32,12 +32,12 @@ from ocr_degradation import (
 )
 from table_grid_protect import build_grid_line_mask, GRID_MASK_DPI
 
+from job_manager import job_manager
+
 logger = logging.getLogger("document_routes")
 document_bp = Blueprint("document_bp", __name__, url_prefix="/api/document")
 
-# Папка document_uploads полностью удалена, все файлы хранятся в памяти (pdf_bytes)
 VALID_MODES = {"native", "ocr"}
-JOBS = {}
 
 
 def sample_bg_color(page, bbox_pt, default_color=(1.0, 1.0, 1.0)):
@@ -854,81 +854,83 @@ def upload_pdf():
     except Exception as exc:
         return jsonify({"error": f"Не удалось открыть PDF: {exc}"}), 400
 
-    job_id = uuid.uuid4().hex[:12]
-    JOBS[job_id] = {
-        "filename": file.filename,
-        "pdf_bytes": pdf_bytes,
-        "page_count": page_count,
-        "mode": mode,
-        "progress": {"percent": 0, "step": "uploaded"},
-        "pages": {},
-    }
-    return jsonify({"job_id": job_id, "page_count": page_count, "mode": mode})
-
+    job = job_manager.create_job(
+        filename=file.filename,
+        pdf_bytes=pdf_bytes,
+        page_count=page_count,
+        mode=mode,
+    )
+    return jsonify({"job_id": job.job_id, "page_count": page_count, "mode": mode})
 
 @document_bp.route("/<job_id>/progress", methods=["GET"])
 def get_progress(job_id):
-    job = JOBS.get(job_id)
+    job = job_manager.get_job(job_id)
     if not job:
         return jsonify({"error": "Задача не найдена"}), 404
-    return jsonify(job["progress"])
+    return jsonify(job.progress)
 
 
 @document_bp.route("/<job_id>/page/<int:page_num>", methods=["GET"])
 def get_page(job_id, page_num):
-    job = JOBS.get(job_id)
+    job = job_manager.get_job(job_id)
     if not job:
         return jsonify({"error": "Задача не найдена"}), 404
 
-    if page_num < 1 or page_num > job["page_count"]:
-        return jsonify({"error": f"Страница {page_num} вне диапазона (1..{job['page_count']})"}), 400
+    if page_num < 1 or page_num > job.page_count:
+        return jsonify({"error": f"Страница {page_num} вне диапазона (1..{job.page_count})"}), 400
 
-    if page_num in job["pages"]:
-        return jsonify(job["pages"][page_num])
+    if page_num in job.pages:
+        return jsonify(job.pages[page_num])
 
     def on_progress(percent, step):
-        job["progress"] = {"percent": percent, "step": step}
+        job.set_progress(percent, step)
 
-    mode = job["mode"]
+    mode = job.mode
     try:
+        # Передаем temp_pdf_path вместо копирования всего массива байтов в память
+        pdf_source = job.temp_pdf_path if os.path.exists(job.temp_pdf_path) else job.pdf_bytes
         if mode == "native":
             result = process_native_page(
-                pdf_source=job["pdf_bytes"],
+                pdf_source=pdf_source,
                 page_number=page_num,
                 job_id=job_id,
                 on_progress=on_progress,
             )
         else:
             result = process_single_page(
-                pdf_source=job["pdf_bytes"],
+                pdf_source=pdf_source,
                 page_number=page_num,
                 job_id=job_id,
                 on_progress=on_progress,
             )
             result.setdefault("source_type", "ocr")
     except OcrPipelineError as exc:
-        job["progress"] = {"percent": 0, "step": "error"}
+        job.set_progress(0, "error")
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         logger.exception("[PDF] unexpected error")
-        job["progress"] = {"percent": 0, "step": "error"}
+        job.set_progress(0, "error")
         return jsonify({"error": f"Внутренняя ошибка обработки: {exc}"}), 500
 
     result["mode"] = mode
     result["image_url"] = f"/api/document/{job_id}/render/{page_num}"
-    job["pages"][page_num] = result
+    job.pages[page_num] = result
     return jsonify(result)
 
 
 @document_bp.route("/<job_id>/render/<int:page_num>", methods=["GET"])
 def get_rendered_image(job_id, page_num):
-    job = JOBS.get(job_id)
-    if not job or not job.get("pdf_bytes"):
+    job = job_manager.get_job(job_id)
+    if not job:
         return jsonify({"error": "Задача не найдена"}), 404
 
-    # Рендерим страницу в PNG на лету из байтов, минуя диск
+    # Открываем напрямую с диска без создания буфера в RAM
     try:
-        doc = fitz.open(stream=job["pdf_bytes"], filetype="pdf")
+        if os.path.exists(job.temp_pdf_path):
+            doc = fitz.open(job.temp_pdf_path)
+        else:
+            doc = fitz.open(stream=job.pdf_bytes, filetype="pdf")
+
         page = doc[page_num - 1]
         pix = page.get_pixmap(dpi=150, alpha=False)
         img_bytes = pix.tobytes("png")
@@ -940,15 +942,23 @@ def get_rendered_image(job_id, page_num):
 
 @document_bp.route("/<job_id>/file", methods=["GET"])
 def get_pdf_file(job_id):
-    job = JOBS.get(job_id)
-    if not job or not job.get("pdf_bytes"):
+    job = job_manager.get_job(job_id)
+    if not job:
         return jsonify({"error": "PDF-файл не найден"}), 404
 
+    if os.path.exists(job.temp_pdf_path):
+        return send_file(
+            job.temp_pdf_path,
+            mimetype="application/pdf",
+            as_attachment=False,
+            download_name=job.filename or "document.pdf",
+        )
+
     return send_file(
-        io.BytesIO(job["pdf_bytes"]),
+        io.BytesIO(job.pdf_bytes),
         mimetype="application/pdf",
         as_attachment=False,
-        download_name=job.get("filename", "document.pdf"),
+        download_name=job.filename or "document.pdf",
     )
 
 
@@ -967,8 +977,8 @@ def export_docx(job_id):
     - OCR-режим: применяет правки пользователя к PDF -> LightOnOCR + Qwen (9B) -> docx_renderer
     - Native-режим: PyMuPDF textual layer -> docx_export
     """
-    job = JOBS.get(job_id)
-    if not job or not job.get("pdf_bytes"):
+    job = job_manager.get_job(job_id)
+    if not job:
         return jsonify({"error": "Задача не найдена"}), 404
 
     body = request.get_json(silent=True) or {}
@@ -1045,8 +1055,8 @@ def export_docx(job_id):
 @document_bp.route("/<job_id>/save", methods=["POST"])
 def save_pdf(job_id):
     """Сохранение отредактированного PDF-файла: как скан (растр) или с текстом."""
-    job = JOBS.get(job_id)
-    if not job or not job.get("pdf_bytes"):
+    job = job_manager.get_job(job_id)
+    if not job:
         return jsonify({"error": "Исходный PDF-файл не найден"}), 404
 
     data = request.get_json(silent=True) or {}
@@ -1102,3 +1112,9 @@ def save_pdf(job_id):
     except Exception as exc:
         logger.exception(f"[PDF] Ошибка сохранения: {exc}")
         return jsonify({"error": f"Не удалось сохранить PDF: {exc}"}), 500
+
+@document_bp.route("/<job_id>", methods=["DELETE"])
+def close_job(job_id):
+    """Явное закрытие сессии пользователем (освобождает временный файл и память)."""
+    success = job_manager.delete_job(job_id)
+    return jsonify({"success": success})
