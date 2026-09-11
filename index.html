@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>BentoPDF</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf_viewer.min.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<link rel="stylesheet" href="{{ url_for('static', filename='pdf_viewer.min.css') }}">
+<script src="{{ url_for('static', filename='pdf.min.js') }}"></script>
 </head>
 <body spellcheck="false" autocorrect="off" autocapitalize="off" autocomplete="off" data-gramm="false">
 <div class="page" id="main-container" spellcheck="false">

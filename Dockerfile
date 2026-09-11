@@ -21,6 +21,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Прогрев моделей PaddleOCR: скачивает веса прямо в образ при сборке
+RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(lang='ru', enable_mkldnn=False)"
+
 # Копируем остальной проект
 COPY . .
 
